@@ -1,15 +1,36 @@
 package localstore
 
 import (
+	"bytes"
 	"fmt"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/juju/errors"
-	"github.com/ngaut/log"
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/types"
 	"github.com/pingcap/tipb/go-tipb"
 )
+
+var singleGroup = []byte("SingleGroup")
+
+func (rs *localRegion) getGroupKey(ctx *selectContext) ([]byte, error) {
+	items := ctx.sel.GetGroupBy()
+	if len(items) == 0 {
+		return singleGroup, nil
+	}
+	vals := make([]types.Datum, 0, len(items))
+	for _, item := range items {
+		v, err := ctx.eval.Eval(item.Expr)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		vals = append(vals, v)
+	}
+	bs, err := codec.EncodeValue([]byte{}, vals...)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return bs, nil
+}
 
 // Update aggregate functions with rows.
 func (rs *localRegion) aggregate(ctx *selectContext, row [][]byte) error {
@@ -21,13 +42,21 @@ func (rs *localRegion) aggregate(ctx *selectContext, row [][]byte) error {
 		}
 		ctx.eval.Row[col.GetColumnId()] = datum
 	}
-	// TODO: Get group key
+	// Get group key.
+	gk, err := rs.getGroupKey(ctx)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if _, ok := ctx.groups[string(gk)]; !ok {
+		ctx.groups[string(gk)] = true
+		ctx.groupKeys = append(ctx.groupKeys, gk)
+	}
+	// Update aggregate funcs.
 	for _, agg := range ctx.aggregates {
-		// update aggregate funcs
+		agg.currentGroup = gk
 		args := make([]types.Datum, len(agg.expr.Children))
 		// Evaluate args
 		for _, x := range agg.expr.Children {
-			// Evaluate it
 			cv, err := ctx.eval.Eval(x)
 			if err != nil {
 				return errors.Trace(err)
@@ -46,13 +75,7 @@ type aggItem struct {
 	// This could be used to store sum/max/min
 	value types.Datum
 	// TODO: support group_concat
-}
-
-func (ai *aggItem) toBytes() []bytes {
-	// Convert each aggItem to []bytes
-
-	// datum to bytes
-	return p
+	buffer *bytes.Buffer // Buffer is used for group_concat.
 }
 
 // This is similar to ast.AggregateFuncExpr but use tipb.Expr.
@@ -79,16 +102,26 @@ func (n *aggregateFuncExpr) update(ctx *selectContext, args []types.Datum) error
 	return errors.New(fmt.Sprintf("Unknown AggExpr: %v", n.expr.GetTp()))
 }
 
-func (n *aggregateFuncExpr) toProto() *tipb.AggExpr {
-	groups := make([]*tipb.AggGroupEntry, 0, len(n.contextPerGroupMap))
-	for key, item := range n.contextPerGroupMap {
-		entry := &tipb.AggGroupEntry{
-			Key:  []byte(key),
-			Item: item.toProto(),
-		}
-		groups = append(groups, entry)
+func (n *aggregateFuncExpr) toDatums() []types.Datum {
+	switch n.expr.GetTp() {
+	case tipb.ExprType_Count:
+		return n.getCountValue()
 	}
-	return &tipb.AggExpr{Groups: groups}
+	// TODO: return error
+	return nil
+}
+
+// Convert count and value to datum list
+func (n *aggregateFuncExpr) getCountValue() []types.Datum {
+	item := n.getAggItem()
+	if item == nil {
+		// TODO: should this happen?
+		return nil
+	}
+	ds := make([]types.Datum, 2)
+	ds[0] = types.NewUintDatum(item.count)
+	ds[1] = item.value
+	return ds
 }
 
 var singleGroupKey = []byte("SingleGroup")

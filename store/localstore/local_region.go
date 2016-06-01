@@ -47,6 +47,7 @@ type selectContext struct {
 	eval         *xeval.Evaluator
 	whereColumns map[int64]*tipb.ColumnInfo
 	groups       map[string]bool
+	groupKeys    [][]byte
 	aggregates   []*aggregateFuncExpr
 }
 
@@ -77,6 +78,8 @@ func (rs *localRegion) Handle(req *regionRequest) (*regionResponse, error) {
 				aggExpr := &aggregateFuncExpr{expr: agg}
 				ctx.aggregates = append(ctx.aggregates, aggExpr)
 			}
+			ctx.groups = make(map[string]bool)
+			ctx.groupKeys = make([][]byte, 0)
 		}
 
 		var rows []*tipb.Row
@@ -89,13 +92,6 @@ func (rs *localRegion) Handle(req *regionRequest) (*regionResponse, error) {
 		selResp := new(tipb.SelectResponse)
 		selResp.Error = toPBError(err)
 		selResp.Rows = rows
-		if len(ctx.aggregates) > 0 {
-			aggs := make([]*tipb.AggExpr, 0, len(ctx.aggregates))
-			for _, agg := range ctx.aggregates {
-				aggs = append(aggs, agg.toProto())
-			}
-			selResp.Aggs = aggs
-		}
 		resp.err = err
 		data, err := proto.Marshal(selResp)
 		if err != nil {
@@ -159,6 +155,37 @@ func (rs *localRegion) getRowsFromSelectReq(ctx *selectContext) ([]*tipb.Row, er
 		}
 		rows = append(rows, ranRows...)
 		limit -= int64(len(ranRows))
+	}
+	if len(ctx.aggregates) > 0 {
+		return rs.getRowsFromAgg(ctx)
+	}
+	return rows, nil
+}
+
+// Convert aggregate partial result to rows.
+func (rs *localRegion) getRowsFromAgg(ctx *selectContext) ([]*tipb.Row, error) {
+	if len(ctx.groupKeys) == 0 {
+		ctx.groupKeys = append(ctx.groupKeys, singleGroup)
+	}
+	rows := make([]*tipb.Row, 0, len(ctx.groupKeys))
+	for _, gk := range ctx.groupKeys {
+		row := new(tipb.Row)
+		// Each aggregate partial result will be converted to two datum.
+		rowData := make([]types.Datum, 1+2*len(ctx.aggregates))
+		// The first column is group key.
+		rowData[0] = types.NewBytesDatum(gk)
+		for i, agg := range ctx.aggregates {
+			agg.currentGroup = gk
+			ds := agg.toDatums()
+			rowData[2*i+1] = ds[0]
+			rowData[2*i+2] = ds[1]
+		}
+		var err error
+		row.Data, err = codec.EncodeValue(nil, rowData...)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		rows = append(rows, row)
 	}
 	return rows, nil
 }

@@ -51,7 +51,7 @@ var (
 // XExecutor defines some interfaces used by dist-sql.
 type XExecutor interface {
 	// AddAggregate adds aggregate info into an executor.
-	AddAggregate(funcs []*tipb.Expr, byItems []*tipb.ByItem)
+	AddAggregate(funcs []*tipb.Expr, byItems []*tipb.ByItem, fields []*types.FieldType)
 	// GetTableName gets the table name of this XExecutor.
 	GetTableName() *ast.TableName
 }
@@ -69,11 +69,13 @@ type XSelectTableExec struct {
 	allFiltersPushed bool
 	aggFuncs         []*tipb.Expr
 	byItems          []*tipb.ByItem
+	aggFields        []*types.FieldType
 }
 
-func (e *XSelectTableExec) AddAggregate(funcs []*tipb.Expr, byItems []*tipb.ByItem) {
+func (e *XSelectTableExec) AddAggregate(funcs []*tipb.Expr, byItems []*tipb.ByItem, fields []*types.FieldType) {
 	e.aggFuncs = funcs
 	e.byItems = byItems
+	e.aggFields = fields
 }
 
 func (e *XSelectTableExec) GetTableName() *ast.TableName {
@@ -1011,4 +1013,131 @@ func (b *executorBuilder) datumsToValueList(datums []types.Datum) *tipb.Expr {
 		return nil
 	}
 	return &tipb.Expr{Tp: tipb.ExprType_ValueList.Enum(), Val: val}
+}
+
+// XAggregateExec deals with all the aggregate functions.
+// It is built from Aggregate Plan. When Next() is called, it reads all the data from Src and updates all the items in AggFuncs.
+// TODO: Support having.
+type XAggregateExec struct {
+	Src          Executor
+	ResultFields []*ast.ResultField
+	AggFields    []*types.FieldType
+	executed     bool
+	ctx          context.Context
+	finish       bool
+	AggFuncs     []*ast.AggregateFuncExpr
+	// TODO: add client side aggregate functions
+	// AggFuncs          []*ClientAggregate
+	groupMap          map[string]bool
+	groups            []string
+	currentGroupIndex int
+}
+
+// Fields implements Executor Fields interface.
+func (e *XAggregateExec) Fields() []*ast.ResultField {
+	return e.ResultFields
+}
+
+// Next implements Executor Next interface.
+func (e *XAggregateExec) Next() (*Row, error) {
+	// In this stage we consider all data from src as a single group.
+	if !e.executed {
+		e.groupMap = make(map[string]bool)
+		e.groups = []string{}
+		for {
+			hasMore, err := e.innerNext()
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+			if !hasMore {
+				break
+			}
+		}
+		e.executed = true
+		if (len(e.groups) == 0) && (len(e.GroupByItems) == 0) {
+			// If no groupby and no data, we should add an empty group.
+			// For example:
+			// "select count(c) from t;" should return one row [0]
+			// "select count(c) from t group by c1;" should return empty result set.
+			e.groups = append(e.groups, singleGroup)
+		}
+	}
+	if e.currentGroupIndex >= len(e.groups) {
+		return nil, nil
+	}
+	groupKey := e.groups[e.currentGroupIndex]
+	for _, af := range e.AggFuncs {
+		af.CurrentGroup = groupKey
+	}
+	e.currentGroupIndex++
+	return &Row{}, nil
+}
+
+func (e *XAggregateExec) getGroupKey() (string, error) {
+	if len(e.GroupByItems) == 0 {
+		return singleGroup, nil
+	}
+	vals := make([]types.Datum, 0, len(e.GroupByItems))
+	for _, item := range e.GroupByItems {
+		v, err := evaluator.Eval(e.ctx, item.Expr)
+		if err != nil {
+			return "", errors.Trace(err)
+		}
+		vals = append(vals, v)
+	}
+	bs, err := codec.EncodeValue([]byte{}, vals...)
+	if err != nil {
+		return "", errors.Trace(err)
+	}
+	return string(bs), nil
+}
+
+// Fetch a single row from src and update each aggregate function.
+// If the first return value is false, it means there is no more data from src.
+func (e *XAggregateExec) innerNext() (bool, error) {
+	if e.Src != nil {
+		srcRow, err := e.Src.Next()
+		if err != nil {
+			return false, errors.Trace(err)
+		}
+		if srcRow == nil {
+			return false, nil
+		}
+	} else {
+		// If Src is nil, only one row should be returned.
+		if e.executed {
+			return false, nil
+		}
+	}
+	e.executed = true
+	groupKey, err := e.getGroupKey()
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+	if _, ok := e.groupMap[groupKey]; !ok {
+		e.groupMap[groupKey] = true
+		e.groups = append(e.groups, groupKey)
+	}
+	for _, af := range e.AggFuncs {
+		for _, arg := range af.Args {
+			_, err := evaluator.Eval(e.ctx, arg)
+			if err != nil {
+				return false, errors.Trace(err)
+			}
+		}
+		af.CurrentGroup = groupKey
+		af.Update()
+	}
+	return true, nil
+}
+
+// Close implements Executor Close interface.
+func (e *XAggregateExec) Close() error {
+	for _, af := range e.AggFuncs {
+		af.Clear()
+	}
+	if e.Src != nil {
+		return e.Src.Close()
+	}
+	return nil
 }

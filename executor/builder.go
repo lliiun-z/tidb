@@ -467,7 +467,29 @@ func (b *executorBuilder) buildAggregate(v *plan.Aggregate) Executor {
 	}
 	log.Debug("Use dist aggregate.")
 	// compose aggregate info
-	xSrc.AddAggregate(pbAggFuncs, pbByItems)
+	// We should infer fields type.
+	// Each agg item will be splited into two datum: count and value
+	// The first field should be group key.
+	fields := make([]*types.FieldType, 1+2*len(v.AggFuncs))
+	gk := types.NewFieldType(mysql.TypeBlob)
+	gk.Charset = charset.CharsetBin
+	gk.Collate = charset.CollationBin
+	fields[0] = gk
+	for i, agg := range v.AggFuncs {
+		ft := types.NewFieldType(mysql.TypeLonglong)
+		ft.Flen = 21
+		ft.Charset = charset.CharsetBin
+		ft.Collate = charset.CollationBin
+		fields[2*i+1] = ft
+		fields[2*i+2] = agg.GetType()
+	}
+	xSrc.AddAggregate(pbAggFuncs, pbByItems, fields)
+	e = &XAggregateExec{
+		Src:          src,
+		ResultFields: v.Fields(),
+		ctx:          b.ctx,
+		AggFuncs:     v.AggFuncs,
+	}
 	return src
 }
 
